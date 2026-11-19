@@ -3,6 +3,7 @@ import json
 import signal
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -17,6 +18,8 @@ HEARTBEAT_INTERVAL = 7.0      # Aplikační ping (server odpojuje až po 10 s)
 CONFIRM_TIMEOUT = 8.0         # Timeout pro potvrzení tahu serverem (s)
 BACKOFF_DELAYS = [2, 4, 8, 16, 30]
 MAX_RECONNECT_ATTEMPTS = 25
+
+MAX_BANK_POCKET_SIZE = 25     # Větší prázdnou plochu raději zavřeme hned (ochrana proti spawnu)
 
 Coord = Tuple[int, int]
 
@@ -58,6 +61,7 @@ class BotState:
     plan_perimeter: List[Coord] = field(default_factory=list)
     plan_start_owned: int = 0
     plan_active: bool = False
+    last_bank_log_mono: float = 0.0
 
     # Řízení běhu a fatálních chyb
     fatal_error: Optional[str] = None
@@ -133,6 +137,66 @@ class ArenaClient:
         self.state.round_state = new_state
         if ends_at is not None:
             self.state.round_ends_at_ms = int(ends_at)
+
+    # --- DETEKCE BEZPEČNÝCH REZERV (BANKOVÁNÍ POLÍ) ---
+
+    def _analyze_safe_banked_cells(
+        self, my_cells: Set[Coord], active_enemies: Set[Coord]
+    ) -> Tuple[Set[Coord], Set[Coord]]:
+        """
+        Rozdělí prázdné kapsy za našimi liniemi na:
+        1) safe_banked: 100% uzavřené našimi kostkami, bez soupeřů a bez tlaku na ochrannou zeď
+                        -> necháme si je až na konec kola!
+        2) threatened_banked: uzavřené kapsy, u jejichž zdi se ale objevil aktivní soupeř
+                              -> okamžitě je vybereme, než soupeř prorazí!
+        """
+        my_nick = self.state.confirmed_nick
+        visited: Set[Coord] = set()
+        safe_banked: Set[Coord] = set()
+        threatened_banked: Set[Coord] = set()
+
+        for y in range(self.state.height):
+            for x in range(self.state.width):
+                start = (x, y)
+                if start in visited or not self._is_free(start):
+                    continue
+
+                # Prohledáme souvislou prázdnou oblast
+                comp: Set[Coord] = {start}
+                queue = deque([start])
+                visited.add(start)
+                touches_enemy = False
+                border_own_cells: Set[Coord] = set()
+
+                while queue:
+                    cx, cy = queue.popleft()
+                    for nx, ny in self._neighbors(cx, cy):
+                        nb = (nx, ny)
+                        owner = self.state.cells.get(nb, "")
+                        if owner == "":
+                            if nb not in visited:
+                                visited.add(nb)
+                                comp.add(nb)
+                                queue.append(nb)
+                        elif owner == my_nick:
+                            border_own_cells.add(nb)
+                        else:
+                            touches_enemy = True
+
+                # Kapsa je pod naší kontrolou jen tehdy, když se jí nedotýká žádný soupeř
+                if not touches_enemy and border_own_cells and len(comp) <= MAX_BANK_POCKET_SIZE:
+                    # Zkontrolujeme, jestli nějaký online soupeř netlačí na ochrannou zeď kapsy
+                    wall_under_attack = any(
+                        nb in active_enemies
+                        for wx, wy in border_own_cells
+                        for nb in self._neighbors(wx, wy)
+                    )
+                    if wall_under_attack:
+                        threatened_banked |= comp
+                    else:
+                        safe_banked |= comp
+
+        return safe_banked, threatened_banked
 
     # --- ZPRACOVÁNÍ PŘÍCHOZÍCH ZPRÁV ---
 
@@ -268,7 +332,6 @@ class ArenaClient:
                     self.state.fatal_error = f"Fatální chyba přihlášení/účtu: {err_text}"
                     return
 
-                # Při 'slow down' server tah zahodil -> okamžitě ho uvolníme k opakování bez odpojení!
                 if "slow down" in lower_err or "rate" in lower_err:
                     self.state.send_interval = min(1.35, self.state.send_interval + 0.03)
                     self.state.backoff_until_mono = max(self.state.backoff_until_mono, now_mono + 0.65)
@@ -300,7 +363,7 @@ class ArenaClient:
             self.log("TAH-OK", f"Potvrzena kostka na {pos} (odezva {dt:.2f} s)")
             self.state.pending_move = None
 
-    # --- STRATEGIE PRO ČTVERCE, POHLCOVÁNÍ NEPŘÁTEL A ÚTOK ---
+    # --- STRATEGIE PRO ČTVERCE, BANKOVÁNÍ A ÚTOK ---
 
     def _build_rectangle_perimeter(self, x0: int, y0: int, w: int, h: int) -> List[Coord]:
         perim: List[Coord] = []
@@ -337,7 +400,12 @@ class ArenaClient:
 
         return min(reachable, key=min_dist_to_enemy)
 
-    def _find_best_perimeter_plan(self, my_cells: Set[Coord], max_side: int = 7) -> List[Coord]:
+    def _find_best_perimeter_plan(
+        self,
+        my_cells: Set[Coord],
+        safe_banked: Set[Coord],
+        max_side: int = 7,
+    ) -> List[Coord]:
         best_perim: List[Coord] = []
         best_score = -1.0
         rem_sec = self._remaining_round_seconds()
@@ -383,10 +451,13 @@ class ArenaClient:
                             if blocked_perim or missing_moves == 0:
                                 continue
 
+                            # Pokud celý plán jen vyplňuje bezpečnou banku za našimi zády, přeskočíme ho
+                            if all(p in safe_banked for p in missing_cells):
+                                continue
+
                             if rem_sec is not None and missing_moves * step_cost_sec > rem_sec:
                                 continue
 
-                            # Penalizace zdí, které přímo sousedí s online nepřítelem (hrozí přerušení)
                             threatened_walls = sum(
                                 1 for mx, my in missing_cells
                                 if any(nb in active_enemies for nb in self._neighbors(mx, my))
@@ -455,6 +526,20 @@ class ArenaClient:
 
         return best_target
 
+    def _pick_bank_harvest_move(
+        self, my_cells: Set[Coord], target_pool: Set[Coord]
+    ) -> Optional[Coord]:
+        """Vybere nejdostupnější políčko z bezpečné rezervy (nejvíce vlastních sousedů)."""
+        best_cell: Optional[Coord] = None
+        best_own_nb = -1
+        for pos in target_pool:
+            if self._is_free(pos):
+                own_nb = self._count_own_neighbors(pos, my_cells)
+                if own_nb >= 1 and own_nb > best_own_nb:
+                    best_own_nb = own_nb
+                    best_cell = pos
+        return best_cell
+
     def _choose_next_move_unlocked(self) -> Optional[Tuple[Coord, bool, str]]:
         my_cells = self._my_cells_unlocked()
         active_enemies = self._active_enemy_set()
@@ -468,6 +553,26 @@ class ArenaClient:
                         if self._is_free((x, y)):
                             return (x, y), True, "START"
             return None
+
+        # Zjistíme, kolik polí máme bezpečně zazděných v bance a jestli některé není v ohrožení
+        safe_banked, threatened_banked = self._analyze_safe_banked_cells(my_cells, active_enemies)
+        rem_sec = self._remaining_round_seconds()
+
+        # 1b. Okamžitá záchrana rezervy, pokud soupeř přitlačil na ochrannou zeď
+        if threatened_banked:
+            rescue = self._pick_bank_harvest_move(my_cells, threatened_banked)
+            if rescue is not None:
+                self._clear_plan_unlocked()
+                return rescue, False, "BANKA-ZÁCHRANA"
+
+        # 1c. Finále kola: vybereme uloženou banku včas před vypršením času
+        if safe_banked and rem_sec is not None:
+            needed_sec = len(safe_banked) * (self.state.send_interval * 1.18) + 12.0
+            if rem_sec <= max(35.0, needed_sec):
+                cash_in = self._pick_bank_harvest_move(my_cells, safe_banked)
+                if cash_in is not None:
+                    self._clear_plan_unlocked()
+                    return cash_in, False, f"BANKA-FINÁLE ({len(safe_banked)})"
 
         # 2. Kontrola rozestavěného obvodu
         if self.state.plan_active and self.state.plan_perimeter:
@@ -492,7 +597,7 @@ class ArenaClient:
                         for nb in self._neighbors(mx, my)
                     )
                     if threat_close:
-                        quick_perim = self._find_best_perimeter_plan(my_cells, max_side=4)
+                        quick_perim = self._find_best_perimeter_plan(my_cells, safe_banked, max_side=4)
                         if quick_perim and len([p for p in quick_perim if self._is_free(p)]) < len(missing_on_plan):
                             self.log("OBRANA", "Nepřítel blízko zdi -> zkracuji obvod pro rychlé uzavření!")
                             self.state.plan_perimeter = quick_perim
@@ -507,8 +612,8 @@ class ArenaClient:
                     self.log("PLÁN", "Obvod ztratil návaznost na vlastní pole, přepočítávám.")
                     self._clear_plan_unlocked()
 
-        # 3. Hledání nového výhodného obvodu
-        new_perim = self._find_best_perimeter_plan(my_cells, max_side=7)
+        # 3. Hledání nového výhodného obvodu (ignoruje čistě bankovní pole)
+        new_perim = self._find_best_perimeter_plan(my_cells, safe_banked, max_side=7)
         if new_perim:
             missing = [p for p in new_perim if self._is_free(p)]
             reachable = [p for p in missing if self._count_own_neighbors(p, my_cells) >= 1]
@@ -529,15 +634,18 @@ class ArenaClient:
         if shark_move is not None:
             return shark_move, False, "ŽRALOK-ÚTOK"
 
-        # 5. Chytrý postup do volného prostoru
+        # 5. Expanze na otevřené frontě (bezpečnou banku zatím necháváme na později!)
         best_fallback: Optional[Coord] = None
         best_fallback_score = -1.0
         my_nick = self.state.confirmed_nick
 
         for mx, my in my_cells:
             for nb in self._neighbors(mx, my):
-                if self._is_free(nb):
-                    open_neighbors = sum(1 for n2 in self._neighbors(nb[0], nb[1]) if self._is_free(n2))
+                if self._is_free(nb) and nb not in safe_banked:
+                    open_neighbors = sum(
+                        1 for n2 in self._neighbors(nb[0], nb[1])
+                        if self._is_free(n2) and n2 not in safe_banked
+                    )
                     setup_steal_bonus = 0.0
                     simulated_my = my_cells | {nb}
                     for n2 in self._neighbors(nb[0], nb[1]):
@@ -552,7 +660,17 @@ class ArenaClient:
                         best_fallback = nb
 
         if best_fallback is not None:
+            now_mono = time.monotonic()
+            if safe_banked and now_mono - self.state.last_bank_log_mono > 20.0:
+                self.state.last_bank_log_mono = now_mono
+                self.log("BANKA", f"Šetřím {len(safe_banked)} jistých polí na později, expanduji na frontě.")
             return best_fallback, False, "VOLNÝ-KROK"
+
+        # 6. Pokud na frontě už nic nezbývá, vybereme uloženou banku
+        if safe_banked:
+            harvest = self._pick_bank_harvest_move(my_cells, safe_banked)
+            if harvest is not None:
+                return harvest, False, f"BANKA-SKLIZEŇ ({len(safe_banked)})"
 
         return None
 
@@ -704,7 +822,7 @@ class ArenaClient:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="WS Aréna - stabilní autonomní klient")
+    parser = argparse.ArgumentParser(description="WS Aréna - autonomní klient s bankováním")
     parser.add_argument("--nick", default=DEFAULT_NICK, help="Přezdívka hráče")
     parser.add_argument("--url", default=DEFAULT_URL, help="WebSocket URL serveru")
     args = parser.parse_args()

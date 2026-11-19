@@ -19,7 +19,7 @@ CONFIRM_TIMEOUT = 8.0         # Timeout pro potvrzení tahu serverem (s)
 BACKOFF_DELAYS = [2, 4, 8, 16, 30]
 MAX_RECONNECT_ATTEMPTS = 25
 
-MAX_BANK_POCKET_SIZE = 25     # Větší prázdnou plochu raději zavřeme hned (ochrana proti spawnu)
+ENDGAME_SAFETY_BUFFER_SEC = 14.0  # Časová rezerva před koncem kola pro vybrání bublin
 
 Coord = Tuple[int, int]
 
@@ -30,6 +30,20 @@ class PendingMove:
     y: int
     sent_at: float
     was_first_spawn: bool
+
+
+@dataclass
+class SealedBubble:
+    cells: Set[Coord]          # Všechna prázdná pole uvnitř bubliny
+    trigger_cells: List[Coord] # Okrajová pole, jejichž zaplněním server vybarví zbytek
+    value: int                 # Celkový zisk polí po uzavření
+
+
+@dataclass
+class OpenGateRing:
+    gate: Coord                # Jediná chybějící kostka k uzavření velkého okruhu
+    interior_value: int        # Počet polí uvnitř, která se po položení brány vybarví
+    enemy_distance: int        # Vzdálenost nejbližšího aktivního soupeře od brány
 
 
 @dataclass
@@ -48,6 +62,7 @@ class BotState:
     round_num: Optional[int] = None
     round_state: str = "waiting"
     round_ends_at_ms: Optional[int] = None
+    server_clock_skew_ms: float = 0.0
 
     pending_move: Optional[PendingMove] = None
     last_sent_type: Optional[str] = None
@@ -57,11 +72,15 @@ class BotState:
     backoff_until_mono: float = 0.0
     send_interval: float = INITIAL_SEND_INTERVAL
 
-    # Aktuální stavební plán obvodu
-    plan_perimeter: List[Coord] = field(default_factory=list)
+    # Aktuální stavební plán velké bubliny / okruhu
+    plan_walls: List[Coord] = field(default_factory=list)
+    plan_gate: Optional[Coord] = None     # Volitelná 1-políčková brána u středového okruhu
+    plan_label: str = ""
+    plan_expected_gain: int = 0
     plan_start_owned: int = 0
     plan_active: bool = False
-    last_bank_log_mono: float = 0.0
+
+    last_status_log_mono: float = 0.0
 
     # Řízení běhu a fatálních chyb
     fatal_error: Optional[str] = None
@@ -97,6 +116,10 @@ class ArenaClient:
                 res.append((nx, ny))
         return res
 
+    def _is_map_border(self, pos: Coord) -> bool:
+        x, y = pos
+        return x == 0 or x == self.state.width - 1 or y == 0 or y == self.state.height - 1
+
     def _count_own_neighbors(self, pos: Coord, my_cells: Set[Coord]) -> int:
         return sum(1 for nb in self._neighbors(pos[0], pos[1]) if nb in my_cells)
 
@@ -104,9 +127,23 @@ class ArenaClient:
         return not self.state.cells.get(pos)
 
     def _clear_plan_unlocked(self) -> None:
-        self.state.plan_perimeter.clear()
+        self.state.plan_walls.clear()
+        self.state.plan_gate = None
+        self.state.plan_label = ""
+        self.state.plan_expected_gain = 0
         self.state.plan_start_owned = 0
         self.state.plan_active = False
+
+    def _remaining_round_seconds(self) -> Optional[float]:
+        if self.state.round_ends_at_ms is None:
+            return None
+        now_ms = time.time() * 1000.0 + self.state.server_clock_skew_ms
+        return max(0.0, (self.state.round_ends_at_ms - now_ms) / 1000.0)
+
+    def _effective_seconds_per_move(self) -> float:
+        # Zahrnuje rozestup tahů i pravidelný aplikační heartbeat ping
+        ping_overhead = HEARTBEAT_INTERVAL / max(1.0, (HEARTBEAT_INTERVAL - self.state.send_interval))
+        return self.state.send_interval * (ping_overhead / (ping_overhead - 1.0)) * 1.06
 
     def _update_players_online_unlocked(self, players_list: Optional[list]) -> None:
         if not isinstance(players_list, list):
@@ -138,22 +175,20 @@ class ArenaClient:
         if ends_at is not None:
             self.state.round_ends_at_ms = int(ends_at)
 
-    # --- DETEKCE BEZPEČNÝCH REZERV (BANKOVÁNÍ POLÍ) ---
+    # --- DETEKCE UZAVŘENÝCH VELKÝCH BUBLIN A OTEVŘENÝCH BRAN ---
 
-    def _analyze_safe_banked_cells(
+    def _detect_sealed_bubbles(
         self, my_cells: Set[Coord], active_enemies: Set[Coord]
-    ) -> Tuple[Set[Coord], Set[Coord]]:
+    ) -> Tuple[List[SealedBubble], List[SealedBubble]]:
         """
-        Rozdělí prázdné kapsy za našimi liniemi na:
-        1) safe_banked: 100% uzavřené našimi kostkami, bez soupeřů a bez tlaku na ochrannou zeď
-                        -> necháme si je až na konec kola!
-        2) threatened_banked: uzavřené kapsy, u jejichž zdi se ale objevil aktivní soupeř
-                              -> okamžitě je vybereme, než soupeř prorazí!
+        Najde všechny prázdné oblasti opřené o okraj mapy, které jsou ze všech vnitřních stran
+        100% uzavřené našimi stěnami (žádný soupeř uvnitř ani na hranici).
+        Vrátí (bezpecne_bubliny, ohrozene_bubliny) seřazené od největší po nejmenší.
         """
         my_nick = self.state.confirmed_nick
         visited: Set[Coord] = set()
-        safe_banked: Set[Coord] = set()
-        threatened_banked: Set[Coord] = set()
+        safe_bubbles: List[SealedBubble] = []
+        threatened_bubbles: List[SealedBubble] = []
 
         for y in range(self.state.height):
             for x in range(self.state.width):
@@ -161,12 +196,11 @@ class ArenaClient:
                 if start in visited or not self._is_free(start):
                     continue
 
-                # Prohledáme souvislou prázdnou oblast
                 comp: Set[Coord] = {start}
                 queue = deque([start])
                 visited.add(start)
                 touches_enemy = False
-                border_own_cells: Set[Coord] = set()
+                border_own_walls: Set[Coord] = set()
 
                 while queue:
                     cx, cy = queue.popleft()
@@ -179,24 +213,87 @@ class ArenaClient:
                                 comp.add(nb)
                                 queue.append(nb)
                         elif owner == my_nick:
-                            border_own_cells.add(nb)
+                            border_own_walls.add(nb)
                         else:
                             touches_enemy = True
 
-                # Kapsa je pod naší kontrolou jen tehdy, když se jí nedotýká žádný soupeř
-                if not touches_enemy and border_own_cells and len(comp) <= MAX_BANK_POCKET_SIZE:
-                    # Zkontrolujeme, jestli nějaký online soupeř netlačí na ochrannou zeď kapsy
-                    wall_under_attack = any(
+                # Bublina je bezpečně zamčená jen tehdy, když se jí nedotýká žádný soupeř
+                # a není to celá prázdná mapa (limit max 45 % plochy)
+                max_bubble_area = int(self.state.width * self.state.height * 0.45)
+                if not touches_enemy and border_own_walls and 1 <= len(comp) <= max_bubble_area:
+                    # K jejímu kompletnímu vybarvení stačí zaplnit její buňky na okraji mapy!
+                    triggers = [p for p in comp if self._is_map_border(p)]
+                    if not triggers:
+                        continue
+
+                    bubble = SealedBubble(
+                        cells=comp,
+                        trigger_cells=triggers,
+                        value=len(comp),
+                    )
+                    wall_threatened = any(
                         nb in active_enemies
-                        for wx, wy in border_own_cells
+                        for wx, wy in border_own_walls
                         for nb in self._neighbors(wx, wy)
                     )
-                    if wall_under_attack:
-                        threatened_banked |= comp
+                    if wall_threatened:
+                        threatened_bubbles.append(bubble)
                     else:
-                        safe_banked |= comp
+                        safe_bubbles.append(bubble)
 
-        return safe_banked, threatened_banked
+        safe_bubbles.sort(key=lambda b: b.value, reverse=True)
+        threatened_bubbles.sort(key=lambda b: b.value, reverse=True)
+        return safe_bubbles, threatened_bubbles
+
+    def _detect_open_gate_rings(
+        self, my_cells: Set[Coord], active_enemies: Set[Coord]
+    ) -> List[OpenGateRing]:
+        """
+        Najde prázdná pole sousedící s naším územím, jejichž jediným položením
+        se uzavře velká vnitřní oblast (>= 8 polí) bez dotyku okraje mapy.
+        """
+        rings: List[OpenGateRing] = []
+        candidates: Set[Coord] = set()
+        for mx, my in my_cells:
+            for nb in self._neighbors(mx, my):
+                if self._is_free(nb) and self._count_own_neighbors(nb, my_cells) >= 2:
+                    candidates.add(nb)
+
+        for gate in candidates:
+            sim_my = my_cells | {gate}
+            checked: Set[Coord] = set()
+            captured_total = 0
+
+            for sx, sy in self._neighbors(gate[0], gate[1]):
+                if (sx, sy) in sim_my or (sx, sy) in checked:
+                    continue
+
+                q = deque([(sx, sy)])
+                comp = {(sx, sy)}
+                touches_edge = False
+
+                while q:
+                    cx, cy = q.popleft()
+                    if self._is_map_border((cx, cy)):
+                        touches_edge = True
+                    for nx, ny in self._neighbors(cx, cy):
+                        if (nx, ny) not in sim_my and (nx, ny) not in comp:
+                            comp.add((nx, ny))
+                            q.append((nx, ny))
+
+                checked |= comp
+                if not touches_edge:
+                    captured_total += len(comp)
+
+            if captured_total >= 8:
+                dist = 999
+                if active_enemies:
+                    gx, gy = gate
+                    dist = min(abs(gx - ex) + abs(gy - ey) for ex, ey in active_enemies)
+                rings.append(OpenGateRing(gate=gate, interior_value=captured_total, enemy_distance=dist))
+
+        rings.sort(key=lambda r: r.interior_value, reverse=True)
+        return rings
 
     # --- ZPRACOVÁNÍ PŘÍCHOZÍCH ZPRÁV ---
 
@@ -258,10 +355,12 @@ class ArenaClient:
                     self.state.successful_handshake = True
 
                 my_count = len(self._my_cells_unlocked())
+                rem = self._remaining_round_seconds()
+                rem_txt = f"{rem:.0f}s" if rem is not None else "?"
                 self.log(
                     "MAPA",
                     f"Načten snímek {self.state.width}x{self.state.height} | "
-                    f"kolo={self.state.round_num} ({self.state.round_state}) | "
+                    f"kolo={self.state.round_num} ({self.state.round_state}, zbývá {rem_txt}) | "
                     f"moje pole={my_count}"
                 )
 
@@ -296,9 +395,11 @@ class ArenaClient:
                 if capturer == self.state.confirmed_nick:
                     stolen = sum(msg.get("from", {}).values()) if isinstance(msg.get("from"), dict) else 0
                     total_now = len(self._my_cells_unlocked())
-                    self.log("ZÁBOR", f"Obklíčeno +{gained} polí (ukradeno: {stolen}) | Celkem: {total_now}")
+                    self.log("ZÁBOR", f"Praskla bublina! +{gained} polí (ukradeno: {stolen}) | Celkem: {total_now}")
 
             elif msg_type in ("round", "scores"):
+                if "now" in msg and msg["now"] is not None:
+                    self.state.server_clock_skew_ms = float(msg["now"]) - (time.time() * 1000.0)
                 self._update_round_unlocked(msg.get("round"))
                 self._update_players_online_unlocked(msg.get("players"))
 
@@ -340,7 +441,7 @@ class ArenaClient:
                         self.log(
                             "TEMPO",
                             f"Tah ({pm.x}, {pm.y}) zpomalen -> zopakuji za 0.65 s "
-                            f"(nový interval {self.state.send_interval:.2f} s)"
+                            f"(interval {self.state.send_interval:.2f} s)"
                         )
                         self.state.pending_move = None
                     return
@@ -363,25 +464,7 @@ class ArenaClient:
             self.log("TAH-OK", f"Potvrzena kostka na {pos} (odezva {dt:.2f} s)")
             self.state.pending_move = None
 
-    # --- STRATEGIE PRO ČTVERCE, BANKOVÁNÍ A ÚTOK ---
-
-    def _build_rectangle_perimeter(self, x0: int, y0: int, w: int, h: int) -> List[Coord]:
-        perim: List[Coord] = []
-        for x in range(x0, x0 + w):
-            perim.append((x, y0))
-        for y in range(y0 + 1, y0 + h):
-            perim.append((x0 + w - 1, y))
-        for x in range(x0 + w - 2, x0 - 1, -1):
-            perim.append((x, y0 + h - 1))
-        for y in range(y0 + h - 2, y0, -1):
-            perim.append((x0, y))
-        return perim
-
-    def _remaining_round_seconds(self) -> Optional[float]:
-        if self.state.round_ends_at_ms is None:
-            return None
-        now_ms = time.time() * 1000.0
-        return max(0.0, (self.state.round_ends_at_ms - now_ms) / 1000.0)
+    # --- GENERÁTOR VELKÝCH BUBLIN (ROHOVÉ L, OKRAJOVÉ U, STŘEDOVÉ MEGA-OKRUHY) ---
 
     def _active_enemy_set(self) -> Set[Coord]:
         nick = self.state.confirmed_nick
@@ -390,111 +473,268 @@ class ArenaClient:
             if owner and owner != nick and self.state.online_players.get(owner, True)
         }
 
-    def _pick_defensive_perimeter_step(self, reachable: List[Coord], active_enemies: Set[Coord]) -> Coord:
+    def _pick_defensive_wall_step(self, reachable: List[Coord], active_enemies: Set[Coord]) -> Coord:
         if len(reachable) == 1 or not active_enemies:
             return reachable[0]
 
-        def min_dist_to_enemy(p: Coord) -> int:
+        def min_dist(p: Coord) -> int:
             px, py = p
             return min(abs(px - ex) + abs(py - ey) for ex, ey in active_enemies)
 
-        return min(reachable, key=min_dist_to_enemy)
+        return min(reachable, key=min_dist)
 
-    def _find_best_perimeter_plan(
+    def _evaluate_interior_value(self, cells_to_check: List[Coord], my_cells: Set[Coord]) -> Tuple[float, int]:
+        """Spočítá bodovou hodnotu a počet polí uvnitř bubliny."""
+        my_nick = self.state.confirmed_nick
+        val = 0.0
+        count = 0
+        for pos in cells_to_check:
+            if pos in my_cells:
+                continue
+            owner = self.state.cells.get(pos, "")
+            if owner == "":
+                val += 1.0
+                count += 1
+            elif owner != my_nick:
+                count += 1
+                if not self.state.online_players.get(owner, True):
+                    val += 3.2
+                else:
+                    val += 2.4
+        return val, count
+
+    def _find_best_macro_bubble_plan(
         self,
         my_cells: Set[Coord],
-        safe_banked: Set[Coord],
-        max_side: int = 7,
-    ) -> List[Coord]:
-        best_perim: List[Coord] = []
-        best_score = -1.0
-        rem_sec = self._remaining_round_seconds()
+        already_banked_cells: Set[Coord],
+        existing_trigger_moves: int,
+    ) -> Optional[Tuple[List[Coord], Optional[Coord], str, int]]:
+        """
+        Hledá největší a nejvýhodnější bubliny na mapě:
+        1) Rohové L-bubliny (2 stěny od okraje k okraji -> zamknou obří roh)
+        2) Okrajové U-bubliny (3 stěny opřené o okraj mapy -> zamknou velký sektor)
+        3) Velké středové okruhy (6x6 až 13x13 s 1-políčkovou spouští)
+        4) Menší obdélníky (3x3 až 5x5) jako záloha
+        Vrátí (seznam_zdi, volitelna_spoust_brana, popis, ocekavany_zisk) nebo None.
+        """
+        W, H = self.state.width, self.state.height
         my_nick = self.state.confirmed_nick
         active_enemies = self._active_enemy_set()
+        rem_sec = self._remaining_round_seconds()
+        sec_per_move = self._effective_seconds_per_move()
 
+        best_plan: Optional[Tuple[List[Coord], Optional[Coord], str, int]] = None
+        best_score = -1.0
+
+        def consider_candidate(
+            walls: List[Coord],
+            interior_cells: List[Coord],
+            trigger_count_after: int,
+            label: str,
+            keep_open_gate: bool = False,
+        ) -> None:
+            nonlocal best_plan, best_score
+
+            # Musí navazovat na naše stávající území
+            if not any(w in my_cells or self._count_own_neighbors(w, my_cells) >= 1 for w in walls):
+                return
+
+            # Zeď nesmí narazit na soupeře ani vést skrz už zamčenou banku
+            missing_walls: List[Coord] = []
+            owned_walls = 0
+            for w in walls:
+                owner = self.state.cells.get(w, "")
+                if owner == my_nick:
+                    owned_walls += 1
+                elif owner == "":
+                    if w in already_banked_cells:
+                        return
+                    missing_walls.append(w)
+                else:
+                    return
+
+            if not missing_walls:
+                return
+
+            # U středového okruhu s bránou necháme poslední kostku jako spoušť (stavíme o 1 méně)
+            build_moves = len(missing_walls) - 1 if (keep_open_gate and len(missing_walls) >= 4) else len(missing_walls)
+            if build_moves <= 0:
+                return
+
+            # Časová kontrola: stihneme postavit tuto bublinu A pak vybrat všechny bubliny do konce kola?
+            total_future_triggers = existing_trigger_moves + trigger_count_after
+            if rem_sec is not None:
+                needed_total_sec = (build_moves + total_future_triggers) * sec_per_move + ENDGAME_SAFETY_BUFFER_SEC
+                if needed_total_sec > rem_sec:
+                    return
+
+            # Ohodnocení vnitřku (musí mít alespoň nějaká nová pole)
+            filtered_interior = [p for p in interior_cells if p not in already_banked_cells]
+            interior_val, interior_count = self._evaluate_interior_value(filtered_interior, my_cells)
+            if interior_count < 3:
+                return
+
+            # Penalizace zdí těsně vedle online soupeřů
+            threatened = sum(
+                1 for mx, my in missing_walls
+                if any(nb in active_enemies for nb in self._neighbors(mx, my))
+            )
+
+            # Nelineární odměna (yield ** 1.35) nutí bota upřednostnit VELKÉ bubliny před malými
+            wall_reuse = 1.0 + (owned_walls / max(1, len(walls))) * 0.7
+            danger_div = 1.0 + threatened * 0.75
+            score = ((interior_val ** 1.35) / build_moves) * wall_reuse / danger_div
+
+            if score > best_score:
+                best_score = score
+                best_plan = (walls, None, label, interior_count)
+
+        # --- TYP A: ROHOVÉ L-BUBLINY (nejefektivnější tvar na mapě!) ---
+        # Rohy: (0,0), (W-1,0), (0,H-1), (W-1,H-1)
+        for bw in range(6, 18):
+            for bh in range(6, 18):
+                # 1. Levý horní roh (0,0) -> zeď (0, bh) .. (bw, bh) .. (bw, 0)
+                if bw < W and bh < H:
+                    walls = [(x, bh) for x in range(0, bw + 1)] + [(bw, y) for y in range(bh - 1, -1, -1)]
+                    interior = [(x, y) for x in range(0, bw) for y in range(0, bh)]
+                    triggers = bw + bh - 1  # okrajové buňky na x=0 a y=0
+                    consider_candidate(walls, interior, triggers, f"ROHOVÁ L-BUBLINA {bw}x{bh}")
+
+                # 2. Pravý horní roh (W-1, 0) -> zeď (W-1, bh) .. (W-1-bw, bh) .. (W-1-bw, 0)
+                x_wall = W - 1 - bw
+                if x_wall >= 0 and bh < H:
+                    walls = [(x, bh) for x in range(W - 1, x_wall - 1, -1)] + [(x_wall, y) for y in range(bh - 1, -1, -1)]
+                    interior = [(x, y) for x in range(x_wall + 1, W) for y in range(0, bh)]
+                    triggers = bw + bh - 1
+                    consider_candidate(walls, interior, triggers, f"ROHOVÁ L-BUBLINA {bw}x{bh}")
+
+                # 3. Levý dolní roh (0, H-1) -> zeď (0, H-1-bh) .. (bw, H-1-bh) .. (bw, H-1)
+                y_wall = H - 1 - bh
+                if bw < W and y_wall >= 0:
+                    walls = [(x, y_wall) for x in range(0, bw + 1)] + [(bw, y) for y in range(y_wall + 1, H)]
+                    interior = [(x, y) for x in range(0, bw) for y in range(y_wall + 1, H)]
+                    triggers = bw + bh - 1
+                    consider_candidate(walls, interior, triggers, f"ROHOVÁ L-BUBLINA {bw}x{bh}")
+
+                # 4. Pravý dolní roh (W-1, H-1)
+                if x_wall >= 0 and y_wall >= 0:
+                    walls = [(x, y_wall) for x in range(W - 1, x_wall - 1, -1)] + [(x_wall, y) for y in range(y_wall + 1, H)]
+                    interior = [(x, y) for x in range(x_wall + 1, W) for y in range(y_wall + 1, H)]
+                    triggers = bw + bh - 1
+                    consider_candidate(walls, interior, triggers, f"ROHOVÁ L-BUBLINA {bw}x{bh}")
+
+        # --- TYP B: OKRAJOVÉ U-BUBLINY (opřené o jednu ze 4 stran mapy) ---
+        # Vybereme jen kotevní body blízko okrajů mapy (do vzdálenosti 15 polí), aby hledání bylo bleskové
+        edge_anchors = [
+            (ax, ay) for (ax, ay) in my_cells
+            if ax <= 15 or ax >= W - 16 or ay <= 15 or ay >= H - 16
+        ]
+        if len(edge_anchors) > 50:
+            edge_anchors = edge_anchors[:: max(1, len(edge_anchors) // 50)]
+
+        seen_u: Set[Tuple[str, int, int, int]] = set()
+        for ax, ay in edge_anchors:
+            for depth in range(5, 15):
+                for span in range(6, 16):
+                    # Levá hrana x=0
+                    if depth < W:
+                        for y0 in (ay, ay - span + 1):
+                            y1 = y0 + span - 1
+                            if 0 <= y0 and y1 < H and ("L", y0, y1, depth) not in seen_u:
+                                seen_u.add(("L", y0, y1, depth))
+                                walls = (
+                                    [(x, y0) for x in range(0, depth + 1)]
+                                    + [(depth, y) for y in range(y0 + 1, y1)]
+                                    + [(x, y1) for x in range(depth, -1, -1)]
+                                )
+                                interior = [(x, y) for x in range(0, depth) for y in range(y0 + 1, y1)]
+                                consider_candidate(walls, interior, span - 2, f"OKRAJOVÁ U-BUBLINA {depth}x{span}")
+
+                    # Pravá hrana x=W-1
+                    x_in = W - 1 - depth
+                    if x_in >= 0:
+                        for y0 in (ay, ay - span + 1):
+                            y1 = y0 + span - 1
+                            if 0 <= y0 and y1 < H and ("R", y0, y1, depth) not in seen_u:
+                                seen_u.add(("R", y0, y1, depth))
+                                walls = (
+                                    [(x, y0) for x in range(W - 1, x_in - 1, -1)]
+                                    + [(x_in, y) for y in range(y0 + 1, y1)]
+                                    + [(x, y1) for x in range(x_in, W)]
+                                )
+                                interior = [(x, y) for x in range(x_in + 1, W) for y in range(y0 + 1, y1)]
+                                consider_candidate(walls, interior, span - 2, f"OKRAJOVÁ U-BUBLINA {depth}x{span}")
+
+                    # Horní hrana y=0
+                    if depth < H:
+                        for x0 in (ax, ax - span + 1):
+                            x1 = x0 + span - 1
+                            if 0 <= x0 and x1 < W and ("T", x0, x1, depth) not in seen_u:
+                                seen_u.add(("T", x0, x1, depth))
+                                walls = (
+                                    [(x0, y) for y in range(0, depth + 1)]
+                                    + [(x, depth) for x in range(x0 + 1, x1)]
+                                    + [(x1, y) for y in range(depth, -1, -1)]
+                                )
+                                interior = [(x, y) for x in range(x0 + 1, x1) for y in range(0, depth)]
+                                consider_candidate(walls, interior, span - 2, f"OKRAJOVÁ U-BUBLINA {span}x{depth}")
+
+                    # Dolní hrana y=H-1
+                    y_in = H - 1 - depth
+                    if y_in >= 0:
+                        for x0 in (ax, ax - span + 1):
+                            x1 = x0 + span - 1
+                            if 0 <= x0 and x1 < W and ("B", x0, x1, depth) not in seen_u:
+                                seen_u.add(("B", x0, x1, depth))
+                                walls = (
+                                    [(x0, y) for y in range(H - 1, y_in - 1, -1)]
+                                    + [(x, y_in) for x in range(x0 + 1, x1)]
+                                    + [(x1, y) for y in range(y_in, H)]
+                                )
+                                interior = [(x, y) for x in range(x0 + 1, x1) for y in range(y_in + 1, H)]
+                                consider_candidate(walls, interior, span - 2, f"OKRAJOVÁ U-BUBLINA {span}x{depth}")
+
+        # --- TYP C: VELKÉ STŘEDOVÉ OKRUHY (6x6 až 12x12) + ZÁLOŽNÍ MENŠÍ (4x4 až 5x5) ---
         anchors = list(my_cells)
-        if len(anchors) > 90:
-            anchors = anchors[:: max(1, len(anchors) // 90)]
+        if len(anchors) > 70:
+            anchors = anchors[:: max(1, len(anchors) // 70)]
 
-        tested_rects: Set[Tuple[int, int, int, int]] = set()
-        step_cost_sec = self.state.send_interval * 1.25
-
+        seen_rects: Set[Tuple[int, int, int, int]] = set()
         for ax, ay in anchors:
-            for side_w in range(3, max_side + 1):
-                for side_h in range(3, max_side + 1):
-                    for x0 in (ax, ax - side_w + 1):
-                        for y0 in (ay, ay - side_h + 1):
-                            if x0 < 0 or y0 < 0 or x0 + side_w > self.state.width or y0 + side_h > self.state.height:
+            for rw in range(4, 13):
+                for rh in range(4, 13):
+                    for x0 in (ax, ax - rw + 1):
+                        for y0 in (ay, ay - rh + 1):
+                            if x0 < 0 or y0 < 0 or x0 + rw > W or y0 + rh > H:
                                 continue
-                            rect_key = (x0, y0, side_w, side_h)
-                            if rect_key in tested_rects:
+                            if (x0, y0, rw, rh) in seen_rects:
                                 continue
-                            tested_rects.add(rect_key)
+                            seen_rects.add((x0, y0, rw, rh))
 
-                            perim = self._build_rectangle_perimeter(x0, y0, side_w, side_h)
-                            perim_set = set(perim)
-
-                            owned_on_perim = sum(1 for p in perim if p in my_cells)
-                            if owned_on_perim == 0:
-                                continue
-
-                            blocked_perim = False
-                            missing_cells: List[Coord] = []
-                            for p in perim:
-                                owner = self.state.cells.get(p, "")
-                                if owner == "":
-                                    missing_cells.append(p)
-                                elif owner != my_nick:
-                                    blocked_perim = True
-                                    break
-                            missing_moves = len(missing_cells)
-                            if blocked_perim or missing_moves == 0:
-                                continue
-
-                            # Pokud celý plán jen vyplňuje bezpečnou banku za našimi zády, přeskočíme ho
-                            if all(p in safe_banked for p in missing_cells):
-                                continue
-
-                            if rem_sec is not None and missing_moves * step_cost_sec > rem_sec:
-                                continue
-
-                            threatened_walls = sum(
-                                1 for mx, my in missing_cells
-                                if any(nb in active_enemies for nb in self._neighbors(mx, my))
+                            walls = (
+                                [(x, y0) for x in range(x0, x0 + rw)]
+                                + [(x0 + rw - 1, y) for y in range(y0 + 1, y0 + rh)]
+                                + [(x, y0 + rh - 1) for x in range(x0 + rw - 2, x0 - 1, -1)]
+                                + [(x0, y) for y in range(y0 + rh - 2, y0, -1)]
+                            )
+                            interior = [
+                                (x, y) for x in range(x0 + 1, x0 + rw - 1)
+                                for y in range(y0 + 1, y0 + rh - 1)
+                            ]
+                            is_big_ring = (rw >= 6 and rh >= 6)
+                            label = f"MEGA-OKRUH {rw}x{rh}" if is_big_ring else f"OKRUH {rw}x{rh}"
+                            consider_candidate(
+                                walls,
+                                interior,
+                                trigger_count_after=(1 if is_big_ring else 0),
+                                label=label,
+                                keep_open_gate=is_big_ring,
                             )
 
-                            interior_value = 0.0
-                            interior_gain_count = 0
-                            for ix in range(x0 + 1, x0 + side_w - 1):
-                                for iy in range(y0 + 1, y0 + side_h - 1):
-                                    if (ix, iy) in perim_set:
-                                        continue
-                                    owner = self.state.cells.get((ix, iy), "")
-                                    if owner == "":
-                                        interior_value += 1.0
-                                        interior_gain_count += 1
-                                    elif owner != my_nick:
-                                        interior_gain_count += 1
-                                        if not self.state.online_players.get(owner, True):
-                                            interior_value += 3.5
-                                        else:
-                                            interior_value += 2.6
-
-                            if interior_gain_count == 0:
-                                continue
-
-                            roi = interior_value / missing_moves
-                            wall_reuse_bonus = 1.0 + (owned_on_perim / len(perim)) * 0.9
-                            danger_factor = 1.0 / (1.0 + threatened_walls * 0.65)
-                            score = roi * wall_reuse_bonus * danger_factor
-
-                            if score > best_score:
-                                best_score = score
-                                best_perim = perim
-
-        return best_perim
+        return best_plan
 
     def _find_shark_assault_move(self, my_cells: Set[Coord]) -> Optional[Coord]:
+        """Útočný režim: přebírá cizí kostky s >= 3 vlastními sousedy (dominový efekt)."""
         my_nick = self.state.confirmed_nick
         best_target: Optional[Coord] = None
         best_score = -1.0
@@ -526,25 +766,28 @@ class ArenaClient:
 
         return best_target
 
-    def _pick_bank_harvest_move(
-        self, my_cells: Set[Coord], target_pool: Set[Coord]
-    ) -> Optional[Coord]:
-        """Vybere nejdostupnější políčko z bezpečné rezervy (nejvíce vlastních sousedů)."""
-        best_cell: Optional[Coord] = None
-        best_own_nb = -1
-        for pos in target_pool:
-            if self._is_free(pos):
-                own_nb = self._count_own_neighbors(pos, my_cells)
-                if own_nb >= 1 and own_nb > best_own_nb:
-                    best_own_nb = own_nb
-                    best_cell = pos
-        return best_cell
+    def _pick_trigger_move_for_bubbles(
+        self, my_cells: Set[Coord], bubbles: List[SealedBubble]
+    ) -> Optional[Tuple[Coord, SealedBubble]]:
+        """Vybere dosažitelnou spouštěcí kostku z největší uložené bubliny."""
+        for bubble in bubbles:  # Již seřazeno od největší po nejmenší
+            reachable = [
+                p for p in bubble.trigger_cells
+                if self._is_free(p) and self._count_own_neighbors(p, my_cells) >= 1
+            ]
+            if reachable:
+                # Preferujeme kostku s více vlastními sousedy pro plynulý postup podél okraje
+                reachable.sort(key=lambda p: self._count_own_neighbors(p, my_cells), reverse=True)
+                return reachable[0], bubble
+        return None
 
     def _choose_next_move_unlocked(self) -> Optional[Tuple[Coord, bool, str]]:
         my_cells = self._my_cells_unlocked()
         active_enemies = self._active_enemy_set()
+        rem_sec = self._remaining_round_seconds()
+        sec_per_move = self._effective_seconds_per_move()
 
-        # 1. První kostka
+        # 1. Startovní kostka
         if not my_cells:
             self._clear_plan_unlocked()
             for margin in (4, 1, 0):
@@ -554,123 +797,155 @@ class ArenaClient:
                             return (x, y), True, "START"
             return None
 
-        # Zjistíme, kolik polí máme bezpečně zazděných v bance a jestli některé není v ohrožení
-        safe_banked, threatened_banked = self._analyze_safe_banked_cells(my_cells, active_enemies)
-        rem_sec = self._remaining_round_seconds()
+        # 2. Analýza všech uložených velkých bublin a otevřených bran
+        safe_bubbles, threatened_bubbles = self._detect_sealed_bubbles(my_cells, active_enemies)
+        open_rings = self._detect_open_gate_rings(my_cells, active_enemies)
 
-        # 1b. Okamžitá záchrana rezervy, pokud soupeř přitlačil na ochrannou zeď
-        if threatened_banked:
-            rescue = self._pick_bank_harvest_move(my_cells, threatened_banked)
-            if rescue is not None:
+        all_banked_cells: Set[Coord] = set()
+        for b in safe_bubbles + threatened_bubbles:
+            all_banked_cells |= b.cells
+
+        total_banked_value = sum(b.value for b in safe_bubbles) + sum(r.interior_value for r in open_rings)
+        total_trigger_moves = sum(len(b.trigger_cells) for b in safe_bubbles) + len(open_rings)
+        time_needed_to_pop = total_trigger_moves * sec_per_move + ENDGAME_SAFETY_BUFFER_SEC
+
+        # 2a. Okamžitá obrana: pokud soupeř tlačí na zeď bubliny nebo se blíží k otevřené bráně okruhu!
+        if threatened_bubbles:
+            pick = self._pick_trigger_move_for_bubbles(my_cells, threatened_bubbles)
+            if pick is not None:
+                pos, b = pick
                 self._clear_plan_unlocked()
-                return rescue, False, "BANKA-ZÁCHRANA"
+                return pos, False, f"BUBLINA-OBRANA (+{b.value})"
 
-        # 1c. Finále kola: vybereme uloženou banku včas před vypršením času
-        if safe_banked and rem_sec is not None:
-            needed_sec = len(safe_banked) * (self.state.send_interval * 1.18) + 12.0
-            if rem_sec <= max(35.0, needed_sec):
-                cash_in = self._pick_bank_harvest_move(my_cells, safe_banked)
-                if cash_in is not None:
-                    self._clear_plan_unlocked()
-                    return cash_in, False, f"BANKA-FINÁLE ({len(safe_banked)})"
+        for ring in open_rings:
+            if ring.enemy_distance <= 3:
+                self._clear_plan_unlocked()
+                return ring.gate, False, f"BRÁNA-ZAVŘÍT (+{ring.interior_value})"
 
-        # 2. Kontrola rozestavěného obvodu
-        if self.state.plan_active and self.state.plan_perimeter:
-            enemy_on_plan = any(
-                self.state.cells.get(p, "") not in ("", self.state.confirmed_nick)
-                for p in self.state.plan_perimeter
+        # 2b. ČASOVÝ SPOUŠTĚČ: Víme, kolik zbývá času -> včas začneme velké bubliny vyplňovat!
+        if total_trigger_moves > 0 and rem_sec is not None and rem_sec <= time_needed_to_pop:
+            self._clear_plan_unlocked()
+            # Rozhodneme, jestli je výhodnější prasknout největší okrajovou bublinu nebo středový okruh
+            best_bubble_pick = self._pick_trigger_move_for_bubbles(my_cells, safe_bubbles)
+            best_ring = open_rings[0] if open_rings else None
+
+            if best_bubble_pick and best_ring:
+                b_pos, b_obj = best_bubble_pick
+                if best_ring.interior_value >= b_obj.value:
+                    return best_ring.gate, False, f"FINÁLE-BRÁNA (+{best_ring.interior_value}, zbývá {rem_sec:.0f}s)"
+                return b_pos, False, f"FINÁLE-BUBLINA (+{b_obj.value}, zbývá {rem_sec:.0f}s)"
+            elif best_ring:
+                return best_ring.gate, False, f"FINÁLE-BRÁNA (+{best_ring.interior_value}, zbývá {rem_sec:.0f}s)"
+            elif best_bubble_pick:
+                b_pos, b_obj = best_bubble_pick
+                return b_pos, False, f"FINÁLE-BUBLINA (+{b_obj.value}, zbývá {rem_sec:.0f}s)"
+
+        # Periodický přehled o stavu banky v logu
+        now_mono = time.monotonic()
+        if total_banked_value > 0 and now_mono - self.state.last_status_log_mono >= 18.0:
+            self.state.last_status_log_mono = now_mono
+            rem_txt = f"{rem_sec:.0f}s" if rem_sec is not None else "?"
+            self.log(
+                "BUBLINA-BANKA",
+                f"Uloženo ~{total_banked_value} polí v {len(safe_bubbles) + len(open_rings)} bublinách "
+                f"(vyplnění zabere ~{time_needed_to_pop:.0f}s, do konce kola zbývá {rem_txt})"
             )
-            missing_on_plan = [p for p in self.state.plan_perimeter if self._is_free(p)]
 
-            if not missing_on_plan:
-                gained_net = len(my_cells) - self.state.plan_start_owned
-                self.log("PLÁN", f"Obvod dokončen! Čistý přírůstek vlastních polí: +{max(0, gained_net)}")
+        # 3. Pokračování ve stavbě rozpracované velké bubliny
+        if self.state.plan_active and self.state.plan_walls:
+            enemy_on_wall = any(
+                self.state.cells.get(p, "") not in ("", self.state.confirmed_nick)
+                for p in self.state.plan_walls
+            )
+            missing_walls = [p for p in self.state.plan_walls if self._is_free(p)]
+
+            # U velkého středového okruhu záměrně necháme poslední 1 kostku jako bránu (pokud nehrozí nepřítel)
+            is_central_ring = "MEGA-OKRUH" in self.state.plan_label
+            if not missing_walls or (is_central_ring and len(missing_walls) == 1):
+                self.log(
+                    "BUBLINA-HOTOVO",
+                    f"{self.state.plan_label} postavena! Rezerva (~{self.state.plan_expected_gain} polí) uložena na konec."
+                )
                 self._clear_plan_unlocked()
-            elif enemy_on_plan:
-                self.log("PLÁN", "Soupeř narušil plánovaný obvod, hledám nový.")
+            elif enemy_on_wall:
+                self.log("BUBLINA-PLÁN", "Soupeř narušil stavbu bubliny, hledám novou velkou oblast.")
                 self._clear_plan_unlocked()
             else:
-                if len(missing_on_plan) > 3:
-                    threat_close = any(
-                        nb in active_enemies
-                        for mx, my in missing_on_plan
-                        for nb in self._neighbors(mx, my)
-                    )
-                    if threat_close:
-                        quick_perim = self._find_best_perimeter_plan(my_cells, safe_banked, max_side=4)
-                        if quick_perim and len([p for p in quick_perim if self._is_free(p)]) < len(missing_on_plan):
-                            self.log("OBRANA", "Nepřítel blízko zdi -> zkracuji obvod pro rychlé uzavření!")
-                            self.state.plan_perimeter = quick_perim
-                            self.state.plan_start_owned = len(my_cells)
-                            missing_on_plan = [p for p in quick_perim if self._is_free(p)]
+                # Kontrola, jestli ještě stihneme bublinu dostavět i vybrat před koncem kola
+                if rem_sec is not None:
+                    needed = (len(missing_walls) + total_trigger_moves + 4) * sec_per_move + ENDGAME_SAFETY_BUFFER_SEC
+                    if needed > rem_sec:
+                        self.log("BUBLINA-PLÁN", "Málo času na dokončení velké stěny -> přecházím na menší/finále.")
+                        self._clear_plan_unlocked()
 
-                reachable = [p for p in missing_on_plan if self._count_own_neighbors(p, my_cells) >= 1]
-                if reachable:
-                    chosen = self._pick_defensive_perimeter_step(reachable, active_enemies)
-                    return chosen, False, "OBVOD"
-                else:
-                    self.log("PLÁN", "Obvod ztratil návaznost na vlastní pole, přepočítávám.")
-                    self._clear_plan_unlocked()
+                if self.state.plan_active:
+                    reachable = [p for p in missing_walls if self._count_own_neighbors(p, my_cells) >= 1]
+                    if reachable:
+                        chosen = self._pick_defensive_wall_step(reachable, active_enemies)
+                        return chosen, False, self.state.plan_label
+                    else:
+                        self._clear_plan_unlocked()
 
-        # 3. Hledání nového výhodného obvodu (ignoruje čistě bankovní pole)
-        new_perim = self._find_best_perimeter_plan(my_cells, safe_banked, max_side=7)
-        if new_perim:
-            missing = [p for p in new_perim if self._is_free(p)]
+        # 4. Naplánování nové velké bubliny (Rohová L -> Okrajová U -> Velký středový okruh)
+        new_plan = self._find_best_macro_bubble_plan(my_cells, all_banked_cells, total_trigger_moves)
+        if new_plan is not None:
+            walls, gate, label, expected_gain = new_plan
+            missing = [p for p in walls if self._is_free(p)]
             reachable = [p for p in missing if self._count_own_neighbors(p, my_cells) >= 1]
             if reachable:
-                self.state.plan_perimeter = new_perim
+                self.state.plan_walls = walls
+                self.state.plan_gate = gate
+                self.state.plan_label = label
+                self.state.plan_expected_gain = expected_gain
                 self.state.plan_start_owned = len(my_cells)
                 self.state.plan_active = True
                 self.log(
-                    "PLÁN",
-                    f"Nový obvod ({len(new_perim)} polí celkem, {len(missing)} chybí postavit) "
-                    f"od {new_perim[0]}"
+                    "BUBLINA-PLÁN",
+                    f"Zahajuji {label}: {len(missing)} tahů zdi -> zamkne ~{expected_gain} polí!"
                 )
-                chosen = self._pick_defensive_perimeter_step(reachable, active_enemies)
-                return chosen, False, "OBVOD"
+                chosen = self._pick_defensive_wall_step(reachable, active_enemies)
+                return chosen, False, label
 
-        # 4. Útočný dominový režim (krádež cizích kostek s >= 3 sousedy)
+        # 5. Útočný dominový režim (krádež cizích kostek s >= 3 sousedy)
         shark_move = self._find_shark_assault_move(my_cells)
         if shark_move is not None:
             return shark_move, False, "ŽRALOK-ÚTOK"
 
-        # 5. Expanze na otevřené frontě (bezpečnou banku zatím necháváme na později!)
-        best_fallback: Optional[Coord] = None
-        best_fallback_score = -1.0
+        # 6. Expanze směrem k volnému prostoru / k okrajům mapy (nevyplňujeme uloženou banku!)
+        best_step: Optional[Coord] = None
+        best_step_score = -1.0
         my_nick = self.state.confirmed_nick
 
         for mx, my in my_cells:
             for nb in self._neighbors(mx, my):
-                if self._is_free(nb) and nb not in safe_banked:
-                    open_neighbors = sum(
+                if self._is_free(nb) and nb not in all_banked_cells:
+                    open_nb = sum(
                         1 for n2 in self._neighbors(nb[0], nb[1])
-                        if self._is_free(n2) and n2 not in safe_banked
+                        if self._is_free(n2) and n2 not in all_banked_cells
                     )
-                    setup_steal_bonus = 0.0
-                    simulated_my = my_cells | {nb}
+                    steal_setup = 0.0
+                    sim_my = my_cells | {nb}
                     for n2 in self._neighbors(nb[0], nb[1]):
                         n2_owner = self.state.cells.get(n2, "")
-                        if n2_owner not in ("", my_nick):
-                            if self._count_own_neighbors(n2, simulated_my) >= 3:
-                                setup_steal_bonus += 4.0
+                        if n2_owner not in ("", my_nick) and self._count_own_neighbors(n2, sim_my) >= 3:
+                            steal_setup += 4.5
 
-                    score = open_neighbors + setup_steal_bonus
-                    if score > best_fallback_score:
-                        best_fallback_score = score
-                        best_fallback = nb
+                    score = open_nb + steal_setup
+                    if score > best_step_score:
+                        best_step_score = score
+                        best_step = nb
 
-        if best_fallback is not None:
-            now_mono = time.monotonic()
-            if safe_banked and now_mono - self.state.last_bank_log_mono > 20.0:
-                self.state.last_bank_log_mono = now_mono
-                self.log("BANKA", f"Šetřím {len(safe_banked)} jistých polí na později, expanduji na frontě.")
-            return best_fallback, False, "VOLNÝ-KROK"
+        if best_step is not None:
+            return best_step, False, "EXPANZE"
 
-        # 6. Pokud na frontě už nic nezbývá, vybereme uloženou banku
-        if safe_banked:
-            harvest = self._pick_bank_harvest_move(my_cells, safe_banked)
-            if harvest is not None:
-                return harvest, False, f"BANKA-SKLIZEŇ ({len(safe_banked)})"
+        # 7. Pokud už na mapě není kam expandovat, začneme vybírat uložené bubliny
+        if open_rings:
+            return open_rings[0].gate, False, f"SKLIZEŇ-BRÁNA (+{open_rings[0].interior_value})"
+        if safe_bubbles:
+            pick = self._pick_trigger_move_for_bubbles(my_cells, safe_bubbles)
+            if pick is not None:
+                pos, b = pick
+                return pos, False, f"SKLIZEŇ-BUBLINA (+{b.value})"
 
         return None
 
@@ -822,7 +1097,7 @@ class ArenaClient:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="WS Aréna - autonomní klient s bankováním")
+    parser = argparse.ArgumentParser(description="WS Aréna - makro-bubliny a časované finále")
     parser.add_argument("--nick", default=DEFAULT_NICK, help="Přezdívka hráče")
     parser.add_argument("--url", default=DEFAULT_URL, help="WebSocket URL serveru")
     args = parser.parse_args()
